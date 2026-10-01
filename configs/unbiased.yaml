@@ -1,0 +1,17 @@
+
+
+init_temp_min: 1
+init_temp_max: 1
+temp_nums: 10
+total_steps: 500
+alpha_star: 0.234
+gamma_c: 0.25
+gamma_ksai: 0.6
+anchor_max: 30
+anchor_min: 0.5
+swap_block_nums: 0
+max_interval: 2.0
+block_reset: 25
+nn_nums: 16
+concentration: 2
+block: true
