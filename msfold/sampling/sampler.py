@@ -11,6 +11,7 @@ import pickle
 from tqdm import tqdm
 from esm.sdk.api import ESMProtein, LogitsConfig
 from esm.utils.constants import esm3 as C
+from esm.utils.structure.protein_complex import ProteinComplex
 
 from msfold.sampling.temperature import (
     non_uniform_log_space_levels,
@@ -24,9 +25,33 @@ from msfold.sampling.exchange import swap_block_state
 from msfold.scoring.sll import batch_cal_seq_likelihood, compute_sll
 from msfold.utils.batching import batch_esm_protein_tensors
 from msfold.utils.io import ensure_output_dir, write_samples_csv, write_run_metadata
+from biotite.structure.io.xtc import XTCFile
+from biotite.structure.io.pdb import PDBFile
+from biotite.structure import AtomArray, stack
 
 logger = logging.getLogger(__name__)
 
+
+def decode_protein_complex(esm_protein: ESMProtein) -> ProteinComplex:
+    return esm_protein.to_protein_complex().infer_oxygen()
+
+
+def get_atom_array(protein_complex: ProteinComplex, include_insertions: bool = True) -> AtomArray:
+    """
+    Concatenate all chains of a ProteinComplex into one AtomArray. zero the b_factor annotation per atom (pLDDT) so frames can be stacked into a trajectory.
+    """
+    atom_array = None
+    for chain in protein_complex.chain_iter():
+        carr = (
+            chain.atom_array
+            if include_insertions
+            else chain.atom_array_no_insertions
+        )
+        atom_array = carr if atom_array is None else atom_array + carr
+    # Single chain: atom_array is the chain's cached array, so copy before modifying
+    atom_array = atom_array.copy()
+    atom_array.b_factor[:] = 0.0
+    return atom_array
 
 def sample_from_sequence(
     sequence: str,
@@ -262,7 +287,7 @@ def sample_from_sequence(
     # --- Decode structures to PDB ---
     logger.info("Decoding structures to PDB...")
     all_samples = []
-
+    all_atom_arr = [[] for _ in range(temp_nums)]
     for block_file in samples_file_list:
         with open(block_file, "rb") as f:
             block_samples = pickle.load(f)
@@ -274,15 +299,11 @@ def sample_from_sequence(
                     p, ESMProtein
                 ), f"Expected ESMProtein, got {type(p)}"
 
-                timestamp = int(time.time())
-                unique_id = uuid.uuid4().hex
-                pdb_dir = f"{output_dir}/temp_{j}"
-                os.makedirs(pdb_dir, exist_ok=True)
-                pdb_filename = (
-                    f"device_batch_gen_{timestamp}_{unique_id}.pdb"
-                )
-                pdb_path = f"{pdb_dir}/{pdb_filename}"
-                p.to_pdb(pdb_path)
+                # new: save everything as an .xtc
+                protein_complex = decode_protein_complex(p) # single chain here. 
+                atom_arr  = get_atom_array(protein_complex)
+                all_atom_arr[j].append(atom_arr)
+                #
 
                 nll_val = x["nll"][j].item()
                 sll_val = compute_sll(
@@ -291,7 +312,7 @@ def sample_from_sequence(
 
                 all_samples.append(
                     {
-                        "sample_id": unique_id,
+                        "sample_id": str(uuid.uuid4().hex),
                         "replica_id": j,
                         "step": x["step"],
                         "temperature": x["temperature"][j].item(),
@@ -299,9 +320,23 @@ def sample_from_sequence(
                         "sll": sll_val,
                         "ptm": p.ptm.item() if p.ptm is not None else None,
                         "plddt": p.plddt.mean().item() if p.plddt is not None else None,
-                        "structure_path": f"temp_{j}/{pdb_filename}",
+                        "structure_path": f"replica_id_{j}/trajectory.xtc",
+                        "frame": len(all_atom_arr[j]) - 1
                     }
                 )
+
+    for j, t in enumerate(all_atom_arr):
+        traj = stack(t)
+        out = f"{output_dir}/replica_id_{j}"
+        os.makedirs(out, exist_ok=True)
+
+        top = PDBFile()
+        top.set_structure(traj[0])
+        top.write(f"{out}/topology.pdb")
+
+        f = XTCFile() # converts angstrom to nm.
+        f.set_structure(traj)
+        f.write(f"{out}/trajectory.xtc")
 
     write_samples_csv(all_samples, output_dir)
 
